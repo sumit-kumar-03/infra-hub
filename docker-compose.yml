@@ -1,0 +1,50 @@
+services:
+
+  mongodb:
+    image: mongo:latest
+    container_name: infra-mongodb
+    env_file:
+      - .env
+    ports:
+      - "27017:27017"  # Exposed to host for external connections
+    volumes:
+      - cve_trove_mongodb_data:/data/db
+    networks:
+      - cve_trove_network
+    restart: unless-stopped
+
+
+  mongo-express:
+    image: mongo-express:latest
+    container_name: infra-mongo-express
+    environment:
+      ME_CONFIG_MONGODB_SERVER: "infra-mongodb"
+      ME_CONFIG_MONGODB_PORT: "27017"
+      ME_CONFIG_MONGODB_ADMINUSERNAME: "${MONGO_INITDB_ROOT_USERNAME}"
+      ME_CONFIG_MONGODB_ADMINPASSWORD: "${MONGO_INITDB_ROOT_PASSWORD}"
+      ME_CONFIG_BASICAUTH_USERNAME: "admin"
+      ME_CONFIG_BASICAUTH_PASSWORD: "trove-admin"
+    ports:
+      - "8081:8081"  # Browser UI for inspecting/visualizing MongoDB data
+    networks:
+      - cve_trove_network
+    depends_on:
+      - mongodb
+    restart: unless-stopped
+
+
+volumes:
+  cve_trove_mongodb_data:
+    # Pre-existing volume, previously owned/created by cve-trove's compose stack.
+    # Marking it external keeps the same data -- no migration/copy needed.
+    name: cve_trove_mongodb_data
+    external: true
+
+
+networks:
+  cve_trove_network:
+    # Owned/created by cve-trove's compose stack (still used there by the worker
+    # and RabbitMQ). Referenced here so this shared Mongo instance stays reachable
+    # by any project attached to that network.
+    name: cve_trove_network
+    external: true
