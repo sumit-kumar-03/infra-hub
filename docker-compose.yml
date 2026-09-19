@@ -8,9 +8,9 @@ services:
     ports:
       - "27017:27017"  # Exposed to host for external connections
     volumes:
-      - cve_trove_mongodb_data:/data/db
+      - infra-mongodb-data:/data/db
     networks:
-      - cve_trove_network
+      - infra-net
     restart: unless-stopped
 
 
@@ -27,7 +27,7 @@ services:
     ports:
       - "8081:8081"  # Browser UI for inspecting/visualizing MongoDB data
     networks:
-      - cve_trove_network
+      - infra-net
     depends_on:
       - mongodb
     restart: unless-stopped
@@ -44,28 +44,27 @@ services:
     ports:
       - "15672:15672"  # Management UI
     volumes:
-      - cve_trove_rabbitmq_data:/var/lib/rabbitmq
+      - infra-rabbitmq-data:/var/lib/rabbitmq
     networks:
-      - cve_trove_network
+      - infra-net
     restart: unless-stopped
 
 
 volumes:
-  cve_trove_mongodb_data:
-    # Pre-existing volume, previously owned/created by cve-trove's compose stack.
-    # Marking it external keeps the same data -- no migration/copy needed.
-    name: cve_trove_mongodb_data
+  infra-mongodb-data:
+    # Data copied over from the original cve-trove-owned volume
+    # (cve_trove_mongodb_data) during the infra-hub migration -- pre-created
+    # and populated via a throwaway container, hence external here.
+    name: infra-mongodb-data
     external: true
-  cve_trove_rabbitmq_data:
-    # Same as above, for RabbitMQ.
-    name: cve_trove_rabbitmq_data
+  infra-rabbitmq-data:
+    # Same as above, copied from cve_trove_rabbitmq_data.
+    name: infra-rabbitmq-data
     external: true
 
 
 networks:
-  cve_trove_network:
-    # Owned/created by cve-trove's compose stack (still used there by the
-    # worker). Referenced here so these shared services stay reachable by
-    # any project attached to that network.
-    name: cve_trove_network
-    external: true
+  infra-net:
+    # Owned/created here -- the shared network backing all infra-hub
+    # services. Other repos (e.g. cve-trove) attach to it as external.
+    name: infra-net
