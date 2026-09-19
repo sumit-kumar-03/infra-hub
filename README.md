@@ -9,17 +9,20 @@ over a shared external Docker network. Container names are intentionally
 generic (`infra-mongodb`, not `cve-trove-mongodb`) since these services are
 shared, not owned by any one project.
 
-## Phase 1: MongoDB
+## Services
 
-Moved out of `cve-trove`'s own compose stack. Services:
+Moved out of `cve-trove`'s own compose stack:
 
 - `infra-mongodb` — MongoDB, port `27017`, data in the pre-existing named
   volume `cve_trove_mongodb_data` (carried over as-is, no data migration).
 - `infra-mongo-express` — web UI for the above, port `8081`.
+- `infra-rabbitmq` — RabbitMQ (management plugin), ports `5672`/`15672`,
+  data in the pre-existing named volume `cve_trove_rabbitmq_data` (carried
+  over as-is, no data migration).
 
-Both attach to the pre-existing external network `cve_trove_network`, so any
-consumer (e.g. `cve-trove-worker`) can resolve the database at the hostname
-`infra-mongodb` as long as it's on that same network.
+All attach to the pre-existing external network `cve_trove_network`, so any
+consumer (e.g. `cve-trove-worker`) can resolve them by hostname
+(`infra-mongodb`, `infra-rabbitmq`) as long as it's on that same network.
 
 ## Usage
 
