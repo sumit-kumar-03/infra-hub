@@ -36,6 +36,15 @@ services:
   rabbitmq:
     image: rabbitmq:3-management
     container_name: infra-rabbitmq
+    # RabbitMQ's node identity (and hence which Mnesia dir under the mounted
+    # volume it uses) defaults to `rabbit@$HOSTNAME`. Without a pinned
+    # hostname, every container recreation gets Docker's random per-container
+    # hostname, so RabbitMQ silently starts a brand-new empty database next
+    # to the old one instead of reusing it -- confirmed live: 6 orphaned
+    # rabbit@<hostid> dirs sitting in infra-rabbitmq-data from past
+    # recreations. Pinning this is what actually fixes that; rabbitmq-init
+    # below is the safety net for genuine first-boot/volume-wipe cases.
+    hostname: infra-rabbitmq
     env_file:
       - .env
     expose:
@@ -48,6 +57,177 @@ services:
     networks:
       - infra-net
     restart: unless-stopped
+    healthcheck:
+      # rabbitmq:3-management has no curl/wget -- rabbitmq-diagnostics is
+      # the bundled tool; check_port_connectivity confirms the management
+      # listener (15672) is actually accepting connections, not just that
+      # the Erlang node is up (plain `ping` would pass before that).
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  # One-shot: (re)creates the per-service vhosts/users/permissions that used
+  # to be set up by hand via `rabbitmqctl` (cve-trove, web-hunting) and were
+  # lost the moment infra-rabbitmq-data got wiped, since nothing reproduced
+  # them. Mirrors es-init's role for kibana_system below, just via the
+  # RabbitMQ management HTTP API instead of ES's security API. Idempotent:
+  # vhosts/permissions are declared state (PUT, safe to repeat), a user is
+  # only created if it doesn't already exist so a manually-rotated password
+  # never gets clobbered by a routine `docker compose up`.
+  rabbitmq-init:
+    image: curlimages/curl:8.10.1
+    container_name: infra-rabbitmq-init
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - infra-net
+    env_file:
+      - .env
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        AUTH="guest:$$RABBITMQ_DEFAULT_PASS"
+        API="http://infra-rabbitmq:15672/api"
+
+        ensure_vhost() {
+          curl -sf -u "$$AUTH" -X PUT "$$API/vhosts/$$1" >/dev/null
+          echo "vhost '$$1' ensured"
+        }
+
+        ensure_user() {
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -u "$$AUTH" "$$API/users/$$1")
+          if [ "$$code" = "404" ]; then
+            curl -sf -u "$$AUTH" -X PUT -H 'Content-Type: application/json' \
+              -d "{\"password\":\"$$2\",\"tags\":\"\"}" "$$API/users/$$1" >/dev/null
+            echo "user '$$1' created"
+          else
+            echo "user '$$1' already exists, leaving password as-is"
+          fi
+        }
+
+        ensure_permissions() {
+          curl -sf -u "$$AUTH" -X PUT -H 'Content-Type: application/json' \
+            -d '{"configure":".*","write":".*","read":".*"}' \
+            "$$API/permissions/$$1/$$2" >/dev/null
+          echo "permissions for '$$2' on '$$1' ensured"
+        }
+
+        ensure_vhost "cve-trove"
+        ensure_user "$$CVETROVE_RABBITMQ_USER" "$$CVETROVE_RABBITMQ_PASSWORD"
+        ensure_permissions "cve-trove" "$$CVETROVE_RABBITMQ_USER"
+
+        ensure_vhost "web-hunting"
+        ensure_user "$$WEBHUNTING_RABBITMQ_USER" "$$WEBHUNTING_RABBITMQ_PASSWORD"
+        ensure_permissions "web-hunting" "$$WEBHUNTING_RABBITMQ_USER"
+
+        echo "rabbitmq-init complete"
+    restart: "no"
+
+
+  # Moved from trident's own compose stack (a per-project ES/Kibana pair
+  # is exactly the kind of duplicated infra this hub exists to avoid).
+  # Data volume copied over from trident's original `trident_es-data`
+  # (15.4MB, a throwaway-container `cp -a`, same pattern as
+  # infra-mongodb-data/infra-rabbitmq-data above) -- the copied data
+  # already has xpack security bootstrapped (kibana_system, and trident's
+  # own worker_service/etl_service accounts all live in the cluster's
+  # internal security index, unaffected by anything below). `elastic`
+  # itself is the one exception: the official ES image's entrypoint
+  # resets the elastic superuser's password to match ELASTIC_PASSWORD on
+  # every container start, even against pre-existing secured data, not
+  # just on first bootstrap -- confirmed live, the freshly-generated
+  # infra-hub value authenticated immediately. kibana_system does NOT get
+  # this treatment (only `elastic` does) -- es-init below sets it
+  # explicitly, the same one action trident's own es-init already
+  # performed for its now-retired local ES.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: infra-elasticsearch
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false
+      - xpack.security.transport.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms4g -Xmx4g
+    volumes:
+      - infra-elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - infra-net
+    # Loopback-only on this host, matching trident's original posture --
+    # never published to the LAN, direct curl access from tri itself only.
+    ports:
+      - "127.0.0.1:9200:9200"
+    mem_limit: 8g
+    cpus: 2
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u elastic:$${ELASTIC_PASSWORD} http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+  # One-shot: sets kibana_system's password (the one account ES's own
+  # entrypoint doesn't auto-reset, see elasticsearch's comment above) --
+  # mirrors trident's own former es-init exactly, just scoped to
+  # infra-hub's single shared cluster instead of a per-project one.
+  es-init:
+    image: curlimages/curl:8.10.1
+    container_name: infra-es-init
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - infra-net
+    env_file:
+      - .env
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -e
+        curl -sf -u "elastic:$$ELASTIC_PASSWORD" -X POST \
+          http://infra-elasticsearch:9200/_security/user/kibana_system/_password \
+          -H 'Content-Type: application/json' \
+          -d "{\"password\":\"$$KIBANA_PASSWORD\"}"
+        echo "kibana_system password set"
+    restart: "no"
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: infra-kibana
+    restart: unless-stopped
+    depends_on:
+      es-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      - ELASTICSEARCH_HOSTS=http://infra-elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+    networks:
+      - infra-net
+    # LAN-reachable (not just loopback), matching trident's original
+    # posture -- usable from a browser without an SSH tunnel. Auth is
+    # enabled; this is a private home LAN.
+    ports:
+      - "5601:5601"
+    mem_limit: 2g
+    cpus: 1
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
 
 
 volumes:
@@ -60,6 +240,11 @@ volumes:
   infra-rabbitmq-data:
     # Same as above, copied from cve_trove_rabbitmq_data.
     name: infra-rabbitmq-data
+    external: true
+  infra-elasticsearch-data:
+    # Copied from trident_es-data during the trident migration -- same
+    # external-volume pattern as the two above.
+    name: infra-elasticsearch-data
     external: true
 
 
